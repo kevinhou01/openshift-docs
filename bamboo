@@ -1,0 +1,33 @@
+Bamboo 主要的原理就是利用 Marathon 的 Event-Bus API，当 Marathon 上的应用发生改变（scaling）时，Event-Bus 会通知对应的 Subscriber (Bamboo)，然后 Subscriber 会做出对应的操作。 。
+
+源码分析 Bamboo 是使用 Golang 开发的，代码量很少，原理也不复杂。
+
+1
+首先是从配置文件读取配置，然后读取对应的环境变量，当环境变量存在时，覆盖相应的配 置项，对应的代码在 configuration#L44 。
+
+2
+然后就是声明一个 EventBus，用来将 Marathon、ZK 发生改变时的动作传递到对应的 Handler 函数中去操作。
+
+3
+在 bamboo.go#L80-L81 这里注册了两个主要的 EventHandler，MarathonEventHandler 对应的是 Marathon 上的应用发生改变时的动作，ServiceEventHandler 对应的是 ZK 上的应用配置发生改变时的动作。
+
+在这里，会使用 listenToZookeeper 监听 ZK 的改变，然后应用到ServiceEventHandler上。
+
+4
+最后启动一个 HTTPServer 作为对 ZK 操作的 API 接口，对于 Marathon 事件的监听，Bamboo 支持 Marathon 的两种方式
+
+主动调用 回调模式 主动调用的过程是首先发起一个 HTTP 请求到 Marathon 的 /v2/events 接口，这个接口是一个 stream 的 HTTP 请求，Marathon 会将应用的改变 push 到建立的连接中。回调模式是 Bamboo 向 Marathon 注册自己的地址，当 Marathon 上的应用发生改变时，会向 Bamboo 注册的地址发送 HTTP 请求，通知 Bamboo。
+
+这两种模式可以通过环境变量 MARATHON_USE_EVENT_STREAM 来启用主动调用的模式，主动调用在本地开发调试 Bamboo 时很有用，这样就不需要 Marathon 回调本机地址了。
+
+无论是回调模式还是主动调用，当 Marathon 的发生改变时，最终都会调用 EventBus.Publish 的方法，而 EventBus.Publish 就会遍历注册的 Handler，然后调用对应的事件的 Handler。
+
+主要两个 Handler 就是上述的 MarathonEventHandler 和 ServiceEventHandler。
+
+在应用启动时会调用 event_handler 的 init 函数，在 init 函数中，通过 updateChan 这个带有 buffer 的 channel 与 handler 进行通信，并且同时也创建了一个带 buffer 的 channel queueUpdateSem，容量为 1，用来保证同一时间只有一个 HAProxy 在更新，并且后续的一个更新操作可以排队，再之后的更新操作就被 block 掉了。
+
+上述的两个 Handler 都会触发更新 HAProxy 的动作，而更新 HAProxy 的流程是，首先通过 ensureLatestConfig 函数确认 HAProxy 配置文件是否有更新的必要，原理就是生成新的 HAProxy 配置，然后读取旧的 HAProxy，对比配置文件是否一致，如果一模一样就放弃此次更新。当确认要更新之后，会通过ReloadValidationCommand定义的命令来检验 HAProxy 的配置是否正确，只有校验通过的配置，才能调用ReloadCommand通知 HAProxy 重新加载新的配置文件。
+
+Bamboo 通过 Golang 的 text/template 来生成 HAProxy 配置文件，语法就是 Golang 的模板语法，然后 Bamboo 加了一些便捷函数。
+
+一些问题 Marathon 上运行多个应用时，并且都通过 Bamboo 配置了 HAProxy 的 ACL，如果一个应用更新时，其他应用的访问会在很短的时间内中断，对于这个问题，可以通过类似于 Marathon-lb 的 HAPROXY_GROUP 的方法，将 Bamboo 绑定到单独的应用组上。 根据客户反馈，HAProxy 在 reload 的过程中，会发生一定几率的中断，yelp 有一篇文章分析这个问题，可以实现 zero-downtime 的 HAProxy reload，然后数人云写了这个据说这可以『实现无中断 Reload Haproxy』。
